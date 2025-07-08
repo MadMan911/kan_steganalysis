@@ -1,0 +1,105 @@
+# === Dataset ===
+class StegoDataset(Dataset):
+    def __init__(self, csv_file):
+        self.annotations = pd.read_csv(csv_file)
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        img_path = self.annotations.iloc[idx, 0]
+        label = int(self.annotations.iloc[idx, 1])
+        image = io.imread(img_path).astype(np.float32) / 255.0
+        image = torch.tensor(image, dtype=torch.float32)
+        if image.ndim == 2:
+            image = image.unsqueeze(0)
+        return image, torch.tensor(label, dtype=torch.float32)
+
+
+# === Training Function ===
+def train_xunetstego_pipeline(csv_path, dataset_name, epochs=10, batch_size=8):
+    log_path = "./training_log_xunetstego.txt"
+    os.makedirs("./checkpoints_xunetstego", exist_ok=True)
+    device = torch.device("cpu")
+
+    df = pd.read_csv(csv_path)
+    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+    train_df.to_csv("./dataset/tmp_train.csv", index=False)
+    val_df.to_csv("./dataset/tmp_val.csv", index=False)
+
+    train_dataset = StegoDataset("./dataset/tmp_train.csv")
+    val_dataset = StegoDataset("./dataset/tmp_val.csv")
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    model = model().to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    best_f1 = 0
+    best_model_state = None
+    start_time = time.time()
+
+    with open(log_path, "a") as log_file:
+        log_file.write(f"\nОбучение модели на датасете {dataset_name}\n")
+
+        for epoch in tqdm(range(1, epochs + 1), desc=dataset_name):
+            model.train()
+            total_loss, total, correct = 0, 0, 0
+            for x_batch, y_batch in train_loader:
+                x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+                optimizer.zero_grad()
+                outputs = model(x_batch)
+                loss = criterion(outputs, y_batch)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item() * x_batch.size(0)
+                preds = torch.sigmoid(outputs) > 0.5
+                correct += (preds == y_batch).sum().item()
+                total += x_batch.size(0)
+
+            train_acc = correct / total
+
+            model.eval()
+            val_loss, val_correct, val_total = 0, 0, 0
+            all_preds, all_labels = [], []
+            with torch.no_grad():
+                for x_batch, y_batch in val_loader:
+                    x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+                    outputs = model(x_batch)
+                    loss = criterion(outputs, y_batch)
+                    val_loss += loss.item() * x_batch.size(0)
+                    preds = torch.sigmoid(outputs) > 0.5
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(y_batch.cpu().numpy())
+                    val_correct += (preds == y_batch).sum().item()
+                    val_total += y_batch.size(0)
+
+            val_acc = val_correct / val_total
+            f1 = f1_score(all_labels, all_preds)
+            elapsed = time.time() - start_time
+            log_file.write(f"Эпоха {epoch:02d} | Accuracy: {val_acc:.4f} | F1: {f1:.4f} | Time: {elapsed:.1f}s\n")
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_model_state = model.state_dict()
+                model_path = f"./checkpoints_xunetstego/xunetstego_{dataset_name}_weights.pt"
+                torch.save(best_model_state, model_path)
+                log_file.write(f"→ Лучшая модель сохранена: {model_path} (F1: {best_f1:.4f})\n")
+
+
+# === Run All ===
+def run_all():
+    datasets = [
+        "train_hugo_low", "train_hugo_much", "train_hugo_mix",
+        "train_wow_low", "train_wow_much", "train_wow_mix"
+    ]
+    for name in datasets:
+        csv_path = f"./dataset/{name}.csv"
+        train_xunetstego_pipeline(csv_path, name)
+
+
+if __name__ == "__main__":
+    run_all()
